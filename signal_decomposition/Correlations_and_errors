@@ -1,0 +1,602 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from scipy.linalg import hankel, svd, eig
+import pywt
+
+# Set global font to Times New Roman
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['mathtext.fontset'] = 'stix'  # For math text
+
+# Parameters
+fs = 120              # Sampling rate in Hz
+duration = 120    # Signal duration in seconds (now 120s for 3 intervals)
+t = np.linspace(0, duration, int(fs * duration), endpoint=False)  # Time vector
+
+# Initialize empty signal
+phi = np.zeros_like(t)
+
+# Component 1: Main breathing component (0-40s)
+interval1 = t < 40
+amp1 = 5.0 + 0.2 * np.sin(2 * np.pi * 0.02 * t[interval1])  # Slow amplitude modulation (0.02 Hz)
+freq1 = 0.25  # 15 BPM
+comp1 = amp1 * np.cos(2 * np.pi * freq1 * t[interval1])
+
+# Component 2: Heart rate component (constant throughout)
+freq2 = 1.2  # 72 BPM
+comp2 = 1 * np.cos(2 * np.pi * freq2 * t)
+
+# Component 3: High-frequency noise (constant throughout)
+freq3 = 5.0  # 5 Hz
+comp3 = 0.005 * np.cos(2 * np.pi * freq3 * t)
+
+# Interval 1 (0-40s)
+phi[interval1] = comp1 + comp2[interval1] + comp3[interval1]
+
+# Interval 2 (40-80s): Different breathing frequency
+interval2 = (t >= 40) & (t < 80)
+amp2 = 5.0 + 0.3 * np.sin(2 * np.pi * 0.015 * t[interval2])  # Different modulation
+freq4 = 17/60  # ≈0.283 Hz (17 BPM)
+comp4 = amp2 * np.cos(2 * np.pi * freq4 * (t[interval2]-40))  # Note: t-40 for phase continuity
+phi[interval2] = comp4 + comp2[interval2] + comp3[interval2]
+
+# Interval 3 (80-120s): Different breathing frequency
+interval3 = t >= 80
+amp3 = 5.0 + 0.15 * np.sin(2 * np.pi * 0.025 * t[interval3])  # Different modulation
+freq5 = 12/60  # 0.2 Hz (12 BPM)
+comp5 = amp3 * np.cos(2 * np.pi * freq5 * (t[interval3]-80))  # Note: t-80 for phase continuity
+phi[interval3] = comp5 + comp2[interval3] + comp3[interval3]
+
+# Add Gaussian noise
+np.random.seed(42)  # For reproducibility
+noise = 2*np.random.randn(len(t))
+phi += noise
+
+# Create true breathing component for comparison
+breathing_true = np.zeros_like(t)
+breathing_true[interval1] = comp1
+breathing_true[interval2] = comp4
+breathing_true[interval3] = comp5
+
+# Plot the simulated signal
+plt.figure(figsize=(12, 4))
+plt.plot(t, phi, label='Synthetic Physiological Signal (φ)', color='blue')
+plt.xlabel('Time [s]', fontsize=12)
+plt.ylabel('Amplitude', fontsize=12)
+plt.title('Three-Interval Signal with Modulated Breathing, Heart Rate, and Noise', 
+          fontsize=14, fontweight='bold')
+plt.axvline(x=40, color='red', linestyle='--', alpha=0.5)
+plt.axvline(x=80, color='red', linestyle='--', alpha=0.5)
+plt.text(20, 2, '15 BPM', ha='center')
+plt.text(60, 2, '17 BPM', ha='center')
+plt.text(100, 2, '12 BPM', ha='center')
+plt.legend(fontsize=10)
+plt.tight_layout()
+plt.show()
+
+print("Signal phi created successfully!")
+print(f"Signal length: {len(phi)} samples")
+print(f"Duration: {duration} seconds")
+print(f"Sampling rate: {fs} Hz")
+
+# =============================================
+# 1. HANKEL DYNAMIC MODE DECOMPOSITION (HDMD)
+# =============================================
+print("\n" + "="*50)
+print("1. HANKEL DYNAMIC MODE DECOMPOSITION (HDMD)")
+print("="*50)
+
+# Build Hankel matrix
+N = len(phi)  # Total number of samples
+m = 150  # number of rows
+n = N - m + 1  # number of columns
+H = hankel(phi[:n], phi[n-1:])
+
+print(f"Hankel matrix shape: {H.shape}")
+
+def hankel_dmd(X, Y, rank=None, tol=1e-10):
+    """Perform Hankel-DMD with proper eigenvalue conversion"""
+    U, s, Vh = svd(X, full_matrices=False)
+    
+    if rank is None:
+        rank = np.sum(s > tol * s[0])
+    
+    U_r = U[:, :rank]
+    s_r = s[:rank]
+    Vh_r = Vh[:rank, :]
+    
+    A_tilde = U_r.conj().T @ Y @ Vh_r.conj().T @ np.diag(1/s_r)
+    evals, evecs = eig(A_tilde)
+    modes = Y @ Vh_r.conj().T @ np.diag(1/s_r) @ evecs
+    
+    dt = 1/fs
+    omega = np.log(evals)/dt
+    frequencies = np.imag(omega)/(2*np.pi)
+    damping_rates = np.real(omega)
+    
+    return modes, evals, frequencies, damping_rates
+
+def diagonal_averaging_improved(H_matrix):
+    """Convert Hankel matrix back to 1D signal with proper handling"""
+    m, n = H_matrix.shape
+    L = m + n - 1
+    result = np.zeros(L)
+    
+    for k in range(L):
+        elements = []
+        for i in range(max(0, k-n+1), min(m, k+1)):
+            j = k - i
+            if 0 <= j < n:
+                elements.append(H_matrix[i, j])
+        
+        if elements:
+            result[k] = np.mean(elements)
+    
+    return result
+
+# Prepare data matrices
+X = H[:, :-1]
+Y = H[:, 1:]
+
+# Perform HDMD
+modes, evals, frequencies, damping_rates = hankel_dmd(X, Y)
+
+# Select respiratory modes
+respiratory_mask = (np.abs(frequencies) >= 0.1) & (np.abs(frequencies) < 0.8)
+respiratory_indices = np.where(respiratory_mask)[0]
+sorted_respiratory = respiratory_indices[np.argsort(np.abs(evals[respiratory_indices]))[::-1]]
+n_resp_modes = min(3, len(sorted_respiratory))
+selected_resp_modes = sorted_respiratory[:n_resp_modes]
+
+print(f"HDMD selected {n_resp_modes} respiratory modes")
+
+# Reconstruct breathing component using HDMD
+def reconstruct_from_modes(selected_modes, X, modes, evals, fs):
+    modes_selected = modes[:, selected_modes]
+    b = np.linalg.pinv(modes_selected) @ X[:, 0]
+    
+    dt = 1/fs
+    omega_selected = np.log(evals[selected_modes]) / dt
+    time_steps = np.arange(X.shape[1])
+    
+    time_dynamics = np.zeros((len(selected_modes), len(time_steps)), dtype=complex)
+    for i, idx in enumerate(selected_modes):
+        time_dynamics[i, :] = b[i] * np.exp(omega_selected[i] * time_steps * dt)
+    
+    X_dmd = np.real(modes_selected @ time_dynamics)
+    reconstructed = diagonal_averaging_improved(X_dmd)
+    return reconstructed
+
+breathing_hdmd = reconstruct_from_modes(selected_resp_modes, X, modes, evals, fs)
+
+# =============================================
+# 2. EMPIRICAL MODE DECOMPOSITION (EMD)
+# =============================================
+print("\n" + "="*50)
+print("2. EMPIRICAL MODE DECOMPOSITION (EMD)")
+print("="*50)
+
+def emd_simple(signal, max_imfs=10):
+    """Simple implementation of Empirical Mode Decomposition (EMD)"""
+    imfs = []
+    residue = signal.copy()
+    
+    for i in range(max_imfs):
+        # Extract IMF
+        imf = extract_imf(residue)
+        
+        # Check stopping criteria
+        if np.sum(np.abs(imf)) < 1e-6 * np.sum(np.abs(signal)):
+            break
+            
+        imfs.append(imf)
+        residue = residue - imf
+        
+        # Check if residue is monotonic (final residue)
+        if is_monotonic(residue):
+            break
+    
+    imfs.append(residue)  # Add final residue
+    return np.array(imfs)
+
+def extract_imf(signal, max_iterations=10):
+    """Extract a single Intrinsic Mode Function"""
+    h = signal.copy()
+    
+    for _ in range(max_iterations):
+        # Find local maxima and minima
+        maxima_idx = find_peaks(h)
+        minima_idx = find_peaks(-h)
+        
+        if len(maxima_idx) < 2 or len(minima_idx) < 2:
+            break
+            
+        # Create envelopes
+        upper_env = interpolate_envelope(np.arange(len(h)), h, maxima_idx)
+        lower_env = interpolate_envelope(np.arange(len(h)), h, minima_idx)
+        
+        # Calculate mean
+        mean_env = (upper_env + lower_env) / 2
+        
+        # Update h
+        h_new = h - mean_env
+        
+        # Check stopping criterion
+        if np.sum((h - h_new)**2) / np.sum(h**2) < 0.01:
+            break
+            
+        h = h_new
+    
+    return h
+
+def find_peaks(signal):
+    """Simple peak finding"""
+    peaks = []
+    for i in range(1, len(signal)-1):
+        if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+            peaks.append(i)
+    return np.array(peaks)
+
+def interpolate_envelope(x, signal, peak_indices):
+    """Simple linear interpolation for envelope"""
+    if len(peak_indices) < 2:
+        return np.zeros_like(signal)
+    
+    # Extend peaks to boundaries
+    extended_indices = np.concatenate([[0], peak_indices, [len(signal)-1]])
+    extended_values = np.concatenate([[signal[0]], signal[peak_indices], [signal[-1]]])
+    
+    return np.interp(x, extended_indices, extended_values)
+
+def is_monotonic(signal):
+    """Check if signal is monotonic"""
+    diff = np.diff(signal)
+    return np.all(diff >= 0) or np.all(diff <= 0)
+
+# Apply EMD
+imfs_emd = emd_simple(phi, max_imfs=10)
+print(f"EMD extracted {len(imfs_emd)} IMFs")
+
+# Analyze IMFs 5-7 (indices 4-6) only
+selected_imfs = [5, 6, 7]  # IMF indices 4-6 (IMFs 5-7)
+
+# Reconstruct breathing signal from IMFs 5-7 regardless of frequency content
+if len(imfs_emd) >= 7:  # Ensure we have enough IMFs
+    breathing_emd = np.sum([imfs_emd[i] for i in selected_imfs], axis=0)
+    print(f"EMD: Breathing component reconstructed from IMFs 5-7")
+else:
+    # Fallback: use whatever IMFs we have in the 5-7 range
+    available_imfs = [i for i in selected_imfs if i < len(imfs_emd)]
+    if available_imfs:
+        breathing_emd = np.sum([imfs_emd[i] for i in available_imfs], axis=0)
+        print(f"EMD: Using available IMFs {[x+1 for x in available_imfs]}")
+    else:
+        # Ultimate fallback: use last available IMFs
+        breathing_emd = np.sum(imfs_emd[-3:], axis=0) if len(imfs_emd) >= 3 else np.sum(imfs_emd, axis=0)
+        print("EMD: Using fallback IMFs")
+
+# =============================================
+# 3. VARIATIONAL MODE DECOMPOSITION (VMD)
+# =============================================
+print("\n" + "="*50)
+print("3. VARIATIONAL MODE DECOMPOSITION (VMD)")
+print("="*50)
+
+def vmd_improved(signal, K=6, alpha=2000, tau=0, DC=False, init=1, tol=1e-6, max_iter=100):
+    """Improved Variational Mode Decomposition implementation"""
+    # Mirror extend signal to reduce boundary effects
+    T = len(signal)
+    f_mirror = np.concatenate([signal[:T//2][::-1], signal, signal[T//2:][::-1]])
+    
+    # Time and frequency domains
+    N = len(f_mirror)
+    t = np.arange(N)
+    freqs = np.fft.fftfreq(N)
+    freqs = np.fft.fftshift(freqs)
+    
+    # Initialize center frequencies
+    omega = np.zeros(K)
+    if init == 1:
+        # Uniform distribution
+        omega = np.linspace(0.05, 0.45, K)
+    elif init == 2:
+        # Initialize based on expected frequencies
+        omega[0] = 0.05   # Low frequency component
+        omega[1] = 0.20   # First breathing frequency (12 BPM)
+        omega[2] = 0.25   # Second breathing frequency (15 BPM) 
+        omega[3] = 0.28   # Third breathing frequency (17 BPM)
+        if K > 4:
+            omega[4] = 1.2/fs  # Heart rate normalized
+            omega[5] = 5.0/fs  # High frequency normalized
+    
+    # Initialize modes in frequency domain
+    u_hat = np.zeros((K, N), dtype=complex)
+    omega_old = omega.copy()
+    
+    # Lagrange multiplier
+    lambda_hat = np.zeros(N, dtype=complex)
+    
+    # FFT of input
+    f_hat = np.fft.fftshift(np.fft.fft(f_mirror))
+    
+    # Main iteration loop
+    n_iter = 0
+    eps = 1e-9
+    
+    while n_iter < max_iter:
+        # Update modes
+        for k in range(K):
+            # Sum of all modes except k
+            sum_uk = np.sum(u_hat, axis=0) - u_hat[k, :]
+            
+            # Update mode k
+            numerator = f_hat - sum_uk - lambda_hat / 2
+            denominator = 1 + alpha * (freqs - omega[k])**2
+            u_hat[k, :] = numerator / (denominator + eps)
+            
+            # Update center frequency
+            power_spectrum = np.abs(u_hat[k, :])**2
+            omega[k] = np.sum(freqs * power_spectrum) / (np.sum(power_spectrum) + eps)
+            omega[k] = np.clip(omega[k], 0, 0.5)  # Ensure valid frequency
+        
+        # Update Lagrange multiplier
+        residual = f_hat - np.sum(u_hat, axis=0)
+        lambda_hat = lambda_hat + tau * residual
+        
+        # Check convergence
+        if n_iter > 0:
+            omega_diff = np.sum(np.abs(omega - omega_old))
+            if omega_diff < tol:
+                break
+        
+        omega_old = omega.copy()
+        n_iter += 1
+    
+    print(f"VMD converged after {n_iter} iterations")
+    
+    # Reconstruct modes in time domain
+    u = np.zeros((K, T))
+    for k in range(K):
+        # IFFT and extract original signal length
+        u_temp = np.real(np.fft.ifft(np.fft.ifftshift(u_hat[k, :])))
+        u[k, :] = u_temp[T//2:T//2+T]  # Extract middle part
+    
+    return u, omega
+
+# Apply VMD
+modes_vmd, omega_vmd = vmd_improved(phi, K=6, alpha=2000, init=2)
+print(f"VMD extracted {len(modes_vmd)} modes")
+
+# Select modes 4 and 5 for breathing component
+breathing_vmd = np.sum(modes_vmd[[0,3,4], :], axis=0)  # Modes 4 and 5 (indices 3 and 4)
+print("VMD: Breathing component reconstructed from modes 4 and 5")
+
+# =============================================
+# 4. WAVELET TRANSFORM
+# =============================================
+print("\n" + "="*50)
+print("4. WAVELET TRANSFORM")
+print("="*50)
+
+def analyze_wavelet_breathing(signal, wavelet='db4', max_level=10):
+    """Improved wavelet analysis for breathing component extraction"""
+    # Determine optimal decomposition level
+    optimal_level = min(max_level, int(np.log2(len(signal))))
+    print(f"Wavelet: Using {optimal_level} decomposition levels")
+    
+    # Perform multilevel decomposition
+    coeffs = pywt.wavedec(signal, wavelet, level=optimal_level)
+    
+    # Analyze frequency content of each level
+    breathing_freq_range = [0.15, 0.35]  # Hz
+    selected_coeffs = [np.zeros_like(c) for c in coeffs]
+    selected_levels = []
+    
+    for i in range(len(coeffs)):
+        # Calculate frequency band for this level
+        if i == 0:  # Approximation coefficients (lowest frequencies)
+            freq_low = 0
+            freq_high = fs / (2 ** (optimal_level + 1))
+            level_name = f"A{optimal_level}"
+        else:  # Detail coefficients
+            level = optimal_level - i + 1
+            freq_low = fs / (2 ** (level + 1))
+            freq_high = fs / (2 ** level)
+            level_name = f"D{level}"
+        
+        # Check overlap with breathing frequency range
+        overlap = not (freq_high < breathing_freq_range[0] or freq_low > breathing_freq_range[1])
+        
+        if overlap:
+            # Calculate energy in breathing frequency range for this level
+            if len(coeffs[i]) > 0:
+                # Reconstruct this level alone to analyze its frequency content
+                test_coeffs = [np.zeros_like(c) for c in coeffs]
+                test_coeffs[i] = coeffs[i]
+                reconstructed_level = pywt.waverec(test_coeffs, wavelet)
+                
+                # Ensure same length
+                if len(reconstructed_level) != len(signal):
+                    reconstructed_level = reconstructed_level[:len(signal)]
+                
+                # Analyze frequency content using PSD
+                freqs_psd, psd = welch(reconstructed_level, fs=fs, 
+                                     nperseg=min(1024, len(reconstructed_level)//4))
+                
+                # Calculate energy in breathing frequency band
+                breathing_mask = (freqs_psd >= breathing_freq_range[0]) & (freqs_psd <= breathing_freq_range[1])
+                breathing_energy = np.sum(psd[breathing_mask])
+                total_energy = np.sum(psd)
+                
+                breathing_ratio = breathing_energy / (total_energy + 1e-10)
+                
+                # Select level if significant breathing energy (threshold = 0.1)
+                if breathing_ratio > 0.1:
+                    selected_coeffs[i] = coeffs[i]
+                    selected_levels.append(level_name)
+    
+    # Reconstruct breathing signal from selected coefficients
+    breathing_reconstructed = pywt.waverec(selected_coeffs, wavelet)
+    
+    # Ensure same length as original signal
+    if len(breathing_reconstructed) != len(signal):
+        breathing_reconstructed = breathing_reconstructed[:len(signal)]
+    
+    return breathing_reconstructed, selected_levels
+
+# Apply improved wavelet analysis
+breathing_wavelet, selected_wt_levels = analyze_wavelet_breathing(phi, wavelet='db4', max_level=10)
+print(f"Wavelet: Selected levels {selected_wt_levels}")
+
+# =============================================
+# ENSURE ALL SIGNALS HAVE SAME LENGTH
+# =============================================
+
+# Find minimum length among all signals
+min_length = min(len(breathing_true), len(breathing_hdmd), len(breathing_emd), 
+                len(breathing_vmd), len(breathing_wavelet))
+
+# Trim all signals to same length
+breathing_true = breathing_true[:min_length]
+breathing_hdmd = breathing_hdmd[:min_length]
+breathing_emd = breathing_emd[:min_length]
+breathing_vmd = breathing_vmd[:min_length]
+breathing_wavelet = breathing_wavelet[:min_length]
+t_plot = t[:min_length]
+
+print(f"\nAll signals trimmed to length: {min_length}")
+
+# =============================================
+# VISUALIZATION - All Methods Comparison
+# =============================================
+print("\n" + "="*50)
+print("CREATING COMPREHENSIVE VISUALIZATION")
+print("="*50)
+
+# Set font sizes for publication quality
+title_fontsize = 16
+label_fontsize = 14
+tick_fontsize = 12
+legend_fontsize = 12
+
+# Create comprehensive comparison plot
+fig, axes = plt.subplots(4, 1, figsize=(15, 14))
+fig.suptitle('Comprehensive Signal Decomposition Comparison: Breathing Component Reconstruction', 
+             fontsize=18, fontweight='bold')
+
+# HDMD subplot
+axes[0].plot(t_plot, breathing_true, 'b-', linewidth=2, label='True Breathing Component')
+axes[0].plot(t_plot, breathing_hdmd, 'r--', linewidth=1.5, label='HDMD Reconstructed', alpha=0.8)
+axes[0].set_title('Hankel Dynamic Mode Decomposition (HDMD)', fontsize=title_fontsize, fontweight='bold')
+axes[0].set_xlabel('Time [s]', fontsize=label_fontsize)
+axes[0].set_ylabel('Amplitude', fontsize=label_fontsize)
+axes[0].legend(fontsize=legend_fontsize)
+axes[0].grid(True, alpha=0.3)
+axes[0].axvline(x=40, color='gray', linestyle='--', alpha=0.5)
+axes[0].axvline(x=80, color='gray', linestyle='--', alpha=0.5)
+axes[0].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+
+# EMD subplot
+axes[1].plot(t_plot, breathing_true, 'b-', linewidth=2, label='True Breathing Component')
+axes[1].plot(t_plot, breathing_emd, 'g--', linewidth=1.5, label='EMD Reconstructed', alpha=0.8)
+axes[1].set_title('Empirical Mode Decomposition (EMD)', fontsize=title_fontsize, fontweight='bold')
+axes[1].set_xlabel('Time [s]', fontsize=label_fontsize)
+axes[1].set_ylabel('Amplitude', fontsize=label_fontsize)
+axes[1].legend(fontsize=legend_fontsize)
+axes[1].grid(True, alpha=0.3)
+axes[1].axvline(x=40, color='gray', linestyle='--', alpha=0.5)
+axes[1].axvline(x=80, color='gray', linestyle='--', alpha=0.5)
+axes[1].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+
+# VMD subplot
+axes[2].plot(t_plot, breathing_true, 'b-', linewidth=2, label='True Breathing Component')
+axes[2].plot(t_plot, breathing_vmd, 'orange', linestyle='--', linewidth=1.5, label='VMD Reconstructed', alpha=0.8)
+axes[2].set_title('Variational Mode Decomposition (VMD)', fontsize=title_fontsize, fontweight='bold')
+axes[2].set_xlabel('Time [s]', fontsize=label_fontsize)
+axes[2].set_ylabel('Amplitude', fontsize=label_fontsize)
+axes[2].legend(fontsize=legend_fontsize)
+axes[2].grid(True, alpha=0.3)
+axes[2].axvline(x=40, color='gray', linestyle='--', alpha=0.5)
+axes[2].axvline(x=80, color='gray', linestyle='--', alpha=0.5)
+axes[2].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+
+# Wavelet subplot
+axes[3].plot(t_plot, breathing_true, 'b-', linewidth=2, label='True Breathing Component')
+axes[3].plot(t_plot, breathing_wavelet, 'm--', linewidth=1.5, label='Wavelet Reconstructed', alpha=0.8)
+axes[3].set_title('Wavelet Transform (db4)', fontsize=title_fontsize, fontweight='bold')
+axes[3].set_xlabel('Time [s]', fontsize=label_fontsize)
+axes[3].set_ylabel('Amplitude', fontsize=label_fontsize)
+axes[3].legend(fontsize=legend_fontsize)
+axes[3].grid(True, alpha=0.3)
+axes[3].axvline(x=40, color='gray', linestyle='--', alpha=0.5)
+axes[3].axvline(x=80, color='gray', linestyle='--', alpha=0.5)
+axes[3].tick_params(axis='both', which='major', labelsize=tick_fontsize)
+
+plt.tight_layout()
+plt.show()
+
+# =============================================
+# PERFORMANCE METRICS CALCULATION
+# =============================================
+print("\n" + "="*50)
+print("PERFORMANCE METRICS COMPARISON")
+print("="*50)
+
+def calculate_metrics(true_signal, reconstructed):
+    """Calculate MSE, RMSE, NRMSE, Pearson correlation, and MAE"""
+    # Mean Squared Error
+    mse = np.mean((true_signal - reconstructed)**2)
+    
+    # Root Mean Squared Error
+    rmse = np.sqrt(mse)
+    
+    # Normalized Root Mean Squared Error
+    nrmse = rmse / np.std(true_signal)
+    
+    # Pearson Correlation Coefficient
+    pearson_r = np.corrcoef(true_signal, reconstructed)[0, 1]
+    
+    # Mean Absolute Error
+    mae = np.mean(np.abs(true_signal - reconstructed))
+    
+    return mse, rmse, nrmse, pearson_r, mae
+
+# Store results for all methods
+methods_data = {
+    'HDMD': breathing_hdmd,
+    'EMD': breathing_emd,
+    'VMD': breathing_vmd,
+    'Wavelet': breathing_wavelet
+}
+
+print("Performance Metrics Summary:")
+print("-" * 80)
+print(f"{'Method':<12} {'RMSE':<12} {'MSE':<12} {'NRMSE':<12} {'Pearson r':<12} {'MAE':<12}")
+print("-" * 80)
+
+results = {}
+for method_name, reconstructed in methods_data.items():
+    mse, rmse, nrmse, pearson_r, mae = calculate_metrics(breathing_true, reconstructed)
+    results[method_name] = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'NRMSE': nrmse,
+        'Pearson_r': pearson_r,
+        'MAE': mae
+    }
+    print(f"{method_name:<12} {rmse:<12.4f} {mse:<12.4f} {nrmse:<12.4f} {pearson_r:<12.4f} {mae:<12.4f}")
+
+# Find best performing methods
+best_rmse = min(results.keys(), key=lambda x: results[x]['RMSE'])
+best_pearson = max(results.keys(), key=lambda x: results[x]['Pearson_r'])
+best_mae = min(results.keys(), key=lambda x: results[x]['MAE'])
+
+print(f"\nBest Performance:")
+print(f"Lowest RMSE: {best_rmse} ({results[best_rmse]['RMSE']:.4f})")
+print(f"Highest Pearson r: {best_pearson} ({results[best_pearson]['Pearson_r']:.4f})")
+print(f"Lowest MAE: {best_mae} ({results[best_mae]['MAE']:.4f})")
+
+print("\n" + "="*50)
+print("DECOMPOSITION ANALYSIS COMPLETE!")
+print("="*50)
+
